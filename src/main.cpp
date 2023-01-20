@@ -432,7 +432,7 @@ start_pipeline (gboolean create_offer)
   pipe1 =
       gst_parse_launch ("webrtcbin bundle-policy=max-bundle name=sendrecv "
       STUN_SERVER
-      "videotestsrc is-live=true pattern=ball ! videoconvert ! queue ! "
+      "videotestsrc is-live=true pattern=ball foreground-color=123456 ! videoconvert ! queue ! "
       /* increase the default keyframe distance, browsers have really long
        * periods between keyframes and rely on PLI events on packet loss to
        * fix corrupted video.
