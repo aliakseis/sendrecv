@@ -19,6 +19,8 @@
 
 #include <string.h>
 
+#include <string>
+
 enum AppState
 {
   APP_STATE_UNKNOWN = 0,
@@ -430,9 +432,10 @@ start_pipeline (gboolean create_offer)
   GError *error = NULL;
 
   pipe1 =
-      gst_parse_launch ("webrtcbin bundle-policy=max-bundle name=sendrecv "
+      gst_parse_launch (("webrtcbin bundle-policy=max-bundle name=sendrecv "
       STUN_SERVER
-      "videotestsrc is-live=true pattern=ball foreground-color=123456 ! videoconvert ! queue ! "
+      + std::string(create_offer ? "videotestsrc ! "
+          : "videotestsrc is-live=true pattern=ball foreground-color=123456 ! videoconvert ! queue ! ") +
       /* increase the default keyframe distance, browsers have really long
        * periods between keyframes and rely on PLI events on packet loss to
        * fix corrupted video.
@@ -442,7 +445,7 @@ start_pipeline (gboolean create_offer)
       "rtpvp8pay name=videopay picture-id-mode=15-bit ! "
       "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
       "audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay name=audiopay ! "
-      "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ", &error);
+      "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ").c_str(), &error);
 
   if (error) {
     gst_printerr ("Failed to parse launch: %s\n", error->message);
