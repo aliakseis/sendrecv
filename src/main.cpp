@@ -49,7 +49,6 @@ static GMainLoop *loop;
 static GstElement *pipe1, *webrtc1 = NULL;
 static GObject *send_channel, *receive_channel;
 
-static SoupWebsocketConnection *ws_conn = NULL;
 static AppState app_state = APP_STATE_UNKNOWN;
 static gchar *peer_id = NULL;
 static gchar *our_id = NULL;
@@ -70,6 +69,165 @@ static GOptionEntry entries[] = {
   {NULL},
 };
 
+
+static gboolean
+cleanup_and_quit_loop(const gchar * msg, enum AppState state);
+
+static void on_server_message(gchar *text);
+
+////////////////////////////////////////////////////////////////////
+
+static SoupWebsocketConnection *ws_conn = NULL;
+
+static void close_signaling_connection()
+{
+    if (ws_conn) {
+        if (soup_websocket_connection_get_state(ws_conn) ==
+            SOUP_WEBSOCKET_STATE_OPEN)
+            /* This will call us again */
+            soup_websocket_connection_close(ws_conn, 1000, "");
+        else
+            g_clear_object(&ws_conn);
+    }
+}
+
+static void signaling_connection_send_text(gchar *text)
+{
+    soup_websocket_connection_send_text(ws_conn, text);
+}
+
+static bool signaling_connection_is_open()
+{
+    return soup_websocket_connection_get_state(ws_conn) ==
+        SOUP_WEBSOCKET_STATE_OPEN;
+}
+
+static void
+soup_websocket_on_server_closed(SoupWebsocketConnection * conn G_GNUC_UNUSED,
+    gpointer user_data G_GNUC_UNUSED)
+{
+    app_state = SERVER_CLOSED;
+    cleanup_and_quit_loop("Server connection closed", APP_STATE_UNKNOWN);
+}
+
+
+static void
+soup_websocket_on_server_message(SoupWebsocketConnection * conn, SoupWebsocketDataType type,
+    GBytes * message, gpointer user_data)
+{
+    gchar *text;
+
+    switch (type) {
+    case SOUP_WEBSOCKET_DATA_BINARY:
+        gst_printerr("Received unknown binary message, ignoring\n");
+        return;
+    case SOUP_WEBSOCKET_DATA_TEXT: {
+        gsize size;
+        const gchar *data = static_cast<const gchar *>(g_bytes_get_data(message, &size));
+        /* Convert to NULL-terminated string */
+        text = g_strndup(data, size);
+        break;
+    }
+    default:
+        g_assert_not_reached();
+    }
+
+    on_server_message(text);
+
+    g_free(text);
+}
+
+static gboolean
+register_with_server(void)
+{
+    gchar *hello;
+
+    if (!signaling_connection_is_open())
+        return FALSE;
+
+    if (!our_id) {
+        gint32 id;
+
+        id = g_random_int_range(10, 10000);
+        gst_print("Registering id %i with server\n", id);
+
+        hello = g_strdup_printf("HELLO %i", id);
+    }
+    else {
+        gst_print("Registering id %s with server\n", our_id);
+
+        hello = g_strdup_printf("HELLO %s", our_id);
+    }
+
+    app_state = SERVER_REGISTERING;
+
+    /* Register with the server with a random integer id. Reply will be received
+     * by on_server_message() */
+    signaling_connection_send_text(hello);
+    g_free(hello);
+
+    return TRUE;
+}
+
+static void
+on_server_connected(SoupSession * session, GAsyncResult * res,
+    SoupMessage * msg)
+{
+    GError *error = NULL;
+
+    ws_conn = soup_session_websocket_connect_finish(session, res, &error);
+    if (error) {
+        cleanup_and_quit_loop(error->message, SERVER_CONNECTION_ERROR);
+        g_error_free(error);
+        return;
+    }
+
+    g_assert_nonnull(ws_conn);
+
+    app_state = SERVER_CONNECTED;
+    gst_print("Connected to signalling server\n");
+
+    g_signal_connect(ws_conn, "closed", G_CALLBACK(soup_websocket_on_server_closed), NULL);
+    g_signal_connect(ws_conn, "message", G_CALLBACK(soup_websocket_on_server_message), NULL);
+
+    /* Register with the server so it knows about us and can accept commands */
+    register_with_server();
+}
+
+/*
+ * Connect to the signalling server. This is the entrypoint for everything else.
+ */
+static void
+connect_to_websocket_server_async(void)
+{
+    SoupLogger *logger;
+    SoupMessage *message;
+    SoupSession *session;
+    const char *https_aliases[] = { "wss", NULL };
+
+    session =
+        soup_session_new_with_options(SOUP_SESSION_SSL_STRICT, !disable_ssl,
+            SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE,
+            //SOUP_SESSION_SSL_CA_FILE, "/etc/ssl/certs/ca-bundle.crt",
+            SOUP_SESSION_HTTPS_ALIASES, https_aliases, NULL);
+
+    logger = soup_logger_new(SOUP_LOGGER_LOG_BODY, -1);
+    soup_session_add_feature(session, SOUP_SESSION_FEATURE(logger));
+    g_object_unref(logger);
+
+    message = soup_message_new(SOUP_METHOD_GET, server_url);
+
+    gst_print("Connecting to server...\n");
+
+    /* Once connected, we will register */
+    soup_session_websocket_connect_async(session, message, NULL, NULL, NULL,
+        (GAsyncReadyCallback)on_server_connected, message);
+    app_state = SERVER_CONNECTING;
+}
+
+////////////////////////////////////////////////////////////////////
+
+
 static gboolean
 cleanup_and_quit_loop (const gchar * msg, enum AppState state)
 {
@@ -78,14 +236,7 @@ cleanup_and_quit_loop (const gchar * msg, enum AppState state)
   if (state > 0)
     app_state = state;
 
-  if (ws_conn) {
-    if (soup_websocket_connection_get_state (ws_conn) ==
-        SOUP_WEBSOCKET_STATE_OPEN)
-      /* This will call us again */
-      soup_websocket_connection_close (ws_conn, 1000, "");
-    else
-      g_clear_object (&ws_conn);
-  }
+  close_signaling_connection();
 
   if (loop) {
     g_main_loop_quit (loop);
@@ -222,7 +373,7 @@ send_ice_candidate_message (GstElement * webrtc G_GNUC_UNUSED, guint mlineindex,
   text = get_string_from_json_object (msg);
   json_object_unref (msg);
 
-  soup_websocket_connection_send_text (ws_conn, text);
+  signaling_connection_send_text(text);
   g_free (text);
 }
 
@@ -259,7 +410,7 @@ send_sdp_to_peer (GstWebRTCSessionDescription * desc)
   text = get_string_from_json_object (msg);
   json_object_unref (msg);
 
-  soup_websocket_connection_send_text (ws_conn, text);
+  signaling_connection_send_text(text);
   g_free (text);
 }
 
@@ -295,7 +446,7 @@ on_negotiation_needed (GstElement * element, gpointer user_data)
   app_state = PEER_CALL_NEGOTIATING;
 
   if (remote_is_offerer) {
-    soup_websocket_connection_send_text (ws_conn, "OFFER_REQUEST");
+      signaling_connection_send_text("OFFER_REQUEST");
   } else if (create_offer) {
     GstPromise *promise =
         gst_promise_new_with_change_func (on_offer_created, NULL, NULL);
@@ -538,8 +689,7 @@ setup_call (void)
 {
   gchar *msg;
 
-  if (soup_websocket_connection_get_state (ws_conn) !=
-      SOUP_WEBSOCKET_STATE_OPEN)
+  if (!signaling_connection_is_open())
     return FALSE;
 
   if (!peer_id)
@@ -548,50 +698,11 @@ setup_call (void)
   gst_print ("Setting up signalling server call with %s\n", peer_id);
   app_state = PEER_CONNECTING;
   msg = g_strdup_printf ("SESSION %s", peer_id);
-  soup_websocket_connection_send_text (ws_conn, msg);
+  signaling_connection_send_text(msg);
   g_free (msg);
   return TRUE;
 }
 
-static gboolean
-register_with_server (void)
-{
-  gchar *hello;
-
-  if (soup_websocket_connection_get_state (ws_conn) !=
-      SOUP_WEBSOCKET_STATE_OPEN)
-    return FALSE;
-
-  if (!our_id) {
-    gint32 id;
-
-    id = g_random_int_range (10, 10000);
-    gst_print ("Registering id %i with server\n", id);
-
-    hello = g_strdup_printf ("HELLO %i", id);
-  } else {
-    gst_print ("Registering id %s with server\n", our_id);
-
-    hello = g_strdup_printf ("HELLO %s", our_id);
-  }
-
-  app_state = SERVER_REGISTERING;
-
-  /* Register with the server with a random integer id. Reply will be received
-   * by on_server_message() */
-  soup_websocket_connection_send_text (ws_conn, hello);
-  g_free (hello);
-
-  return TRUE;
-}
-
-static void
-on_server_closed (SoupWebsocketConnection * conn G_GNUC_UNUSED,
-    gpointer user_data G_GNUC_UNUSED)
-{
-  app_state = SERVER_CLOSED;
-  cleanup_and_quit_loop ("Server connection closed", APP_STATE_UNKNOWN);
-}
 
 /* Answer created by our pipeline, to be sent to the peer */
 static void
@@ -644,33 +755,13 @@ on_offer_received (GstSDPMessage * sdp)
 }
 
 /* One mega message handler for our asynchronous calling mechanism */
-static void
-on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
-    GBytes * message, gpointer user_data)
-{
-  gchar *text;
-
-  switch (type) {
-    case SOUP_WEBSOCKET_DATA_BINARY:
-      gst_printerr ("Received unknown binary message, ignoring\n");
-      return;
-    case SOUP_WEBSOCKET_DATA_TEXT:{
-      gsize size;
-      const gchar *data = static_cast<const gchar *>(g_bytes_get_data (message, &size));
-      /* Convert to NULL-terminated string */
-      text = g_strndup (data, size);
-      break;
-    }
-    default:
-      g_assert_not_reached ();
-  }
-
+static void on_server_message(gchar *text) {
   if (g_strcmp0 (text, "HELLO") == 0) {
     /* Server has accepted our registration, we are ready to send commands */
     if (app_state != SERVER_REGISTERING) {
       cleanup_and_quit_loop ("ERROR: Received HELLO when not registering",
           APP_STATE_ERROR);
-      goto out;
+      return;
     }
     app_state = SERVER_REGISTERED;
     gst_print ("Registered with server\n");
@@ -678,7 +769,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
       /* Ask signalling server to connect us with a specific peer */
       if (!setup_call ()) {
         cleanup_and_quit_loop ("ERROR: Failed to setup call", PEER_CALL_ERROR);
-        goto out;
+        return;
       }
     } else {
       gst_println ("Waiting for connection from peer (our-id: %s)", our_id);
@@ -689,7 +780,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
     if (app_state != PEER_CONNECTING) {
       cleanup_and_quit_loop ("ERROR: Received SESSION_OK when not calling",
           PEER_CONNECTION_ERROR);
-      goto out;
+      return;
     }
 
     app_state = PEER_CONNECTED;
@@ -700,7 +791,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
   } else if (g_strcmp0 (text, "OFFER_REQUEST") == 0) {
     if (app_state != SERVER_REGISTERED) {
       gst_printerr ("Received OFFER_REQUEST at a strange time, ignoring\n");
-      goto out;
+      return;
     }
     gst_print ("Received OFFER_REQUEST, sending offer\n");
     /* Peer wants us to start negotiation (exchange SDP and ICE candidates) */
@@ -735,14 +826,14 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
     if (!json_parser_load_from_data (parser, text, -1, NULL)) {
       gst_printerr ("Unknown message '%s', ignoring\n", text);
       g_object_unref (parser);
-      goto out;
+      return;
     }
 
     root = json_parser_get_root (parser);
     if (!JSON_NODE_HOLDS_OBJECT (root)) {
       gst_printerr ("Unknown json message '%s', ignoring\n", text);
       g_object_unref (parser);
-      goto out;
+      return;
     }
 
     /* If peer connection wasn't made yet and we are expecting peer will
@@ -771,7 +862,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
       if (!json_object_has_member (child, "type")) {
         cleanup_and_quit_loop ("ERROR: received SDP without 'type'",
             PEER_CALL_ERROR);
-        goto out;
+        return;
       }
 
       sdptype = json_object_get_string_member (child, "type");
@@ -784,7 +875,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
       text = json_object_get_string_member (child, "sdp");
       ret = gst_sdp_message_new (&sdp);
       g_assert_cmphex (ret, ==, GST_SDP_OK);
-      ret = gst_sdp_message_parse_buffer ((guint8 *) text, strlen (text), sdp);
+      ret = gst_sdp_message_parse_buffer ((guint8 *) text, (guint) strlen(text), sdp);
       g_assert_cmphex (ret, ==, GST_SDP_OK);
 
       if (g_str_equal (sdptype, "answer")) {
@@ -813,7 +904,7 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
 
       child = json_object_get_object_member (object, "ice");
       candidate = json_object_get_string_member (child, "candidate");
-      sdpmlineindex = json_object_get_int_member (child, "sdpMLineIndex");
+      sdpmlineindex = (guint)json_object_get_int_member(child, "sdpMLineIndex");
 
       /* Add ice candidate sent by remote peer */
       g_signal_emit_by_name (webrtc1, "add-ice-candidate", sdpmlineindex,
@@ -824,70 +915,13 @@ on_server_message (SoupWebsocketConnection * conn, SoupWebsocketDataType type,
     g_object_unref (parser);
   }
 
-out:
-  g_free (text);
 }
 
-static void
-on_server_connected (SoupSession * session, GAsyncResult * res,
-    SoupMessage * msg)
-{
-  GError *error = NULL;
 
-  ws_conn = soup_session_websocket_connect_finish (session, res, &error);
-  if (error) {
-    cleanup_and_quit_loop (error->message, SERVER_CONNECTION_ERROR);
-    g_error_free (error);
-    return;
-  }
-
-  g_assert_nonnull (ws_conn);
-
-  app_state = SERVER_CONNECTED;
-  gst_print ("Connected to signalling server\n");
-
-  g_signal_connect (ws_conn, "closed", G_CALLBACK (on_server_closed), NULL);
-  g_signal_connect (ws_conn, "message", G_CALLBACK (on_server_message), NULL);
-
-  /* Register with the server so it knows about us and can accept commands */
-  register_with_server ();
-}
-
-/*
- * Connect to the signalling server. This is the entrypoint for everything else.
- */
-static void
-connect_to_websocket_server_async (void)
-{
-  SoupLogger *logger;
-  SoupMessage *message;
-  SoupSession *session;
-  const char *https_aliases[] = { "wss", NULL };
-
-  session =
-      soup_session_new_with_options (SOUP_SESSION_SSL_STRICT, !disable_ssl,
-      SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE,
-      //SOUP_SESSION_SSL_CA_FILE, "/etc/ssl/certs/ca-bundle.crt",
-      SOUP_SESSION_HTTPS_ALIASES, https_aliases, NULL);
-
-  logger = soup_logger_new (SOUP_LOGGER_LOG_BODY, -1);
-  soup_session_add_feature (session, SOUP_SESSION_FEATURE (logger));
-  g_object_unref (logger);
-
-  message = soup_message_new (SOUP_METHOD_GET, server_url);
-
-  gst_print ("Connecting to server...\n");
-
-  /* Once connected, we will register */
-  soup_session_websocket_connect_async (session, message, NULL, NULL, NULL,
-      (GAsyncReadyCallback) on_server_connected, message);
-  app_state = SERVER_CONNECTING;
-}
 
 static gboolean
 check_plugins (void)
 {
-  int i;
   gboolean ret;
   GstPlugin *plugin;
   GstRegistry *registry;
@@ -897,7 +931,7 @@ check_plugins (void)
 
   registry = gst_registry_get ();
   ret = TRUE;
-  for (i = 0; i < g_strv_length ((gchar **) needed); i++) {
+  for (guint i = 0; i < g_strv_length ((gchar **) needed); i++) {
     plugin = gst_registry_find_plugin (registry, needed[i]);
     if (!plugin) {
       gst_print ("Required gstreamer plugin '%s' not found\n", needed[i]);
