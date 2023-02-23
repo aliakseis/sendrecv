@@ -75,6 +75,10 @@ cleanup_and_quit_loop(const gchar * msg, enum AppState state);
 
 static void on_server_message(gchar *text);
 
+static gboolean
+start_pipeline(gboolean create_offer);
+
+
 ////////////////////////////////////////////////////////////////////
 
 static SoupWebsocketConnection *ws_conn = NULL;
@@ -111,6 +115,26 @@ soup_websocket_on_server_closed(SoupWebsocketConnection * conn G_GNUC_UNUSED,
 }
 
 
+static gboolean
+setup_call(void)
+{
+    gchar *msg;
+
+    if (!signaling_connection_is_open())
+        return FALSE;
+
+    if (!peer_id)
+        return FALSE;
+
+    gst_print("Setting up signalling server call with %s\n", peer_id);
+    app_state = PEER_CONNECTING;
+    msg = g_strdup_printf("SESSION %s", peer_id);
+    signaling_connection_send_text(msg);
+    g_free(msg);
+    return TRUE;
+}
+
+
 static void
 soup_websocket_on_server_message(SoupWebsocketConnection * conn, SoupWebsocketDataType type,
     GBytes * message, gpointer user_data)
@@ -132,7 +156,46 @@ soup_websocket_on_server_message(SoupWebsocketConnection * conn, SoupWebsocketDa
         g_assert_not_reached();
     }
 
-    on_server_message(text);
+    if (g_strcmp0(text, "HELLO") == 0) {
+        /* Server has accepted our registration, we are ready to send commands */
+        if (app_state != SERVER_REGISTERING) {
+            cleanup_and_quit_loop("ERROR: Received HELLO when not registering",
+                APP_STATE_ERROR);
+            g_free(text);
+            return;
+        }
+        app_state = SERVER_REGISTERED;
+        gst_print("Registered with server\n");
+        if (!our_id) {
+            /* Ask signalling server to connect us with a specific peer */
+            if (!setup_call()) {
+                cleanup_and_quit_loop("ERROR: Failed to setup call", PEER_CALL_ERROR);
+                g_free(text);
+                return;
+            }
+        }
+        else {
+            gst_println("Waiting for connection from peer (our-id: %s)", our_id);
+        }
+    }
+    else if (g_strcmp0(text, "SESSION_OK") == 0) {
+        /* The call initiated by us has been setup by the server; now we can start
+         * negotiation */
+        if (app_state != PEER_CONNECTING) {
+            cleanup_and_quit_loop("ERROR: Received SESSION_OK when not calling",
+                PEER_CONNECTION_ERROR);
+            g_free(text);
+            return;
+        }
+
+        app_state = PEER_CONNECTED;
+        /* Start negotiation (exchange SDP and ICE candidates) */
+        if (!start_pipeline(TRUE))
+            cleanup_and_quit_loop("ERROR: failed to start pipeline",
+                PEER_CALL_ERROR);
+    }
+    else 
+        on_server_message(text);
 
     g_free(text);
 }
@@ -198,7 +261,7 @@ on_server_connected(SoupSession * session, GAsyncResult * res,
  * Connect to the signalling server. This is the entrypoint for everything else.
  */
 static void
-connect_to_websocket_server_async(void)
+connect_to_signaling_server_async(void)
 {
     SoupLogger *logger;
     SoupMessage *message;
@@ -684,25 +747,6 @@ err:
   return FALSE;
 }
 
-static gboolean
-setup_call (void)
-{
-  gchar *msg;
-
-  if (!signaling_connection_is_open())
-    return FALSE;
-
-  if (!peer_id)
-    return FALSE;
-
-  gst_print ("Setting up signalling server call with %s\n", peer_id);
-  app_state = PEER_CONNECTING;
-  msg = g_strdup_printf ("SESSION %s", peer_id);
-  signaling_connection_send_text(msg);
-  g_free (msg);
-  return TRUE;
-}
-
 
 /* Answer created by our pipeline, to be sent to the peer */
 static void
@@ -756,46 +800,14 @@ on_offer_received (GstSDPMessage * sdp)
 
 /* One mega message handler for our asynchronous calling mechanism */
 static void on_server_message(gchar *text) {
-  if (g_strcmp0 (text, "HELLO") == 0) {
-    /* Server has accepted our registration, we are ready to send commands */
-    if (app_state != SERVER_REGISTERING) {
-      cleanup_and_quit_loop ("ERROR: Received HELLO when not registering",
-          APP_STATE_ERROR);
-      return;
-    }
-    app_state = SERVER_REGISTERED;
-    gst_print ("Registered with server\n");
-    if (!our_id) {
-      /* Ask signalling server to connect us with a specific peer */
-      if (!setup_call ()) {
-        cleanup_and_quit_loop ("ERROR: Failed to setup call", PEER_CALL_ERROR);
-        return;
-      }
-    } else {
-      gst_println ("Waiting for connection from peer (our-id: %s)", our_id);
-    }
-  } else if (g_strcmp0 (text, "SESSION_OK") == 0) {
-    /* The call initiated by us has been setup by the server; now we can start
-     * negotiation */
-    if (app_state != PEER_CONNECTING) {
-      cleanup_and_quit_loop ("ERROR: Received SESSION_OK when not calling",
-          PEER_CONNECTION_ERROR);
-      return;
-    }
-
-    app_state = PEER_CONNECTED;
-    /* Start negotiation (exchange SDP and ICE candidates) */
-    if (!start_pipeline (TRUE))
-      cleanup_and_quit_loop ("ERROR: failed to start pipeline",
-          PEER_CALL_ERROR);
-  } else if (g_strcmp0 (text, "OFFER_REQUEST") == 0) {
+  if (g_strcmp0 (text, "OFFER_REQUEST") == 0) {
     if (app_state != SERVER_REGISTERED) {
       gst_printerr ("Received OFFER_REQUEST at a strange time, ignoring\n");
       return;
     }
     gst_print ("Received OFFER_REQUEST, sending offer\n");
     /* Peer wants us to start negotiation (exchange SDP and ICE candidates) */
-    if (!start_pipeline (TRUE))
+    if (!start_pipeline(TRUE))
       cleanup_and_quit_loop ("ERROR: failed to start pipeline",
           PEER_CALL_ERROR);
   } else if (g_str_has_prefix (text, "ERROR")) {
@@ -989,7 +1001,7 @@ main (int argc, char *argv[])
 
   loop = g_main_loop_new (NULL, FALSE);
 
-  connect_to_websocket_server_async ();
+  connect_to_signaling_server_async();
 
   g_main_loop_run (loop);
 
