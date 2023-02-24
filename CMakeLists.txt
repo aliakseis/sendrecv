@@ -29,6 +29,10 @@ message("GSTREAMER_LIBRARY_DIRS: ${GSTREAMER_LIBRARY_DIRS}")
 # gstreamermm のライブラリのパスを設定
 link_directories(${GSTREAMER_LIBRARY_DIRS})
 
+find_package(crossguid CONFIG REQUIRED)
+
+find_package(curl CONFIG REQUIRED)
+
 # コンパイルフラグを設定
 #set(CMAKE_C_FLAGS "-Wall")
 #set(CMAKE_C_FLAGS_DEBUG "-g3 -O0 -pg")
@@ -44,13 +48,13 @@ link_directories(${GSTREAMER_LIBRARY_DIRS})
 
 # 実行ファイルの作成
 add_executable(sendrecv 
-  src/main.cpp)
+  src/main.cpp src/http.cpp src/http.h)
 
 # gstreamer ヘッダーへのパスを設定
 target_include_directories(sendrecv  PUBLIC ${GSTREAMER_INCLUDE_DIRS})
 
 # gstreamermm ライブラリの設定
-target_link_libraries(sendrecv  ${GSTREAMER_LIBRARIES} )
+target_link_libraries(sendrecv  ${GSTREAMER_LIBRARIES} crossguid CURL::libcurl)
 #target_link_libraries(sendrecv  pthread)
 
 # gstreamer のコンパイルオプションを設定
