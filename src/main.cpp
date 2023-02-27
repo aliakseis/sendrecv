@@ -24,7 +24,7 @@
 #include <crossguid/guid.hpp>
 
 
-#include <string.h>
+#include <cstring>
 
 #include <string>
 #include <string_view>
@@ -58,7 +58,7 @@ enum AppState
 GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 
 static GMainLoop *loop;
-static GstElement *pipe1, *webrtc1 = NULL;
+static GstElement *pipe1, *webrtc1 = nullptr;
 static GObject *send_channel, *receive_channel;
 
 static AppState app_state = APP_STATE_UNKNOWN;
@@ -66,8 +66,8 @@ static AppState app_state = APP_STATE_UNKNOWN;
 
 static gchar *session_id = nullptr;
 
-static gchar *peer_id = NULL;
-static gchar *our_id = NULL;
+static gchar *peer_id = nullptr;
+static gchar *our_id = nullptr;
 
 static const gchar *server_url = "wss://webrtc.nirbheek.in:8443";
 static gboolean disable_ssl = FALSE;
@@ -88,14 +88,14 @@ static GOptionEntry entries[] = {
         "String ID of the session that peer can connect to us", "ID"},
   {"server", 0, 0, G_OPTION_ARG_STRING, &server_url,
         "Signalling server to connect to", "URL"},
-  {"disable-ssl", 0, 0, G_OPTION_ARG_NONE, &disable_ssl, "Disable ssl", NULL},
+  {"disable-ssl", 0, 0, G_OPTION_ARG_NONE, &disable_ssl, "Disable ssl", nullptr},
 
-  {"autovideosrc", 0, 0, G_OPTION_ARG_NONE, &autovideosrc, "Use autovideosrc", NULL},
-  {"autoaudiosrc", 0, 0, G_OPTION_ARG_NONE, &autoaudiosrc, "Use autoaudiosrc", NULL},
+  {"autovideosrc", 0, 0, G_OPTION_ARG_NONE, &autovideosrc, "Use autovideosrc", nullptr},
+  {"autoaudiosrc", 0, 0, G_OPTION_ARG_NONE, &autoaudiosrc, "Use autoaudiosrc", nullptr},
 
   {"remote-offerer", 0, 0, G_OPTION_ARG_NONE, &remote_is_offerer,
-      "Request that the peer generate the offer and we'll answer", NULL},
-  {NULL},
+      "Request that the peer generate the offer and we'll answer", nullptr},
+  {nullptr},
 };
 
 
@@ -159,7 +159,7 @@ protected:
         if (!content_type) content_type = "";
 
         if (!strncmp(content_type, expected_content_type, strlen(expected_content_type)))
-            return 0;
+            return nullptr;
 
         return "Invalid content_type, should be '" EXPECTED_CONTENT_TYPE "'.";
     }
@@ -175,7 +175,7 @@ protected:
             ) {
                 const char* headers[] = {
                     "Accept: text/event-stream",
-                    NULL
+                    nullptr
                 };
 
                 auto on_data = [this, &startedPromise](char *ptr, size_t size, size_t nmemb)->size_t {
@@ -189,7 +189,7 @@ protected:
                             pData += sizeof(watch) / sizeof(watch[0]) - 1;
 
                             JsonParser *parser = json_parser_new();
-                            if (!json_parser_load_from_data(parser, pData, ptrEnd - pData, NULL)) {
+                            if (!json_parser_load_from_data(parser, pData, ptrEnd - pData, nullptr)) {
                                 //gst_printerr("Unknown message '%s', ignoring\n", text);
                                 g_object_unref(parser);
                                 break; //goto out;
@@ -264,7 +264,7 @@ protected:
 
                 char buffer[1024];
                 sprintf(buffer, recv_message_url, session_id);
-                http(HTTP_GET, buffer, headers, 0, 0, on_data, verify_sse_response, progress_callback);
+                http(HTTP_GET, buffer, headers, nullptr, 0, on_data, verify_sse_response, progress_callback);
         };
 
         // https://stackoverflow.com/a/23454840/10472202
@@ -289,7 +289,7 @@ protected:
 };
 
 
-static SoupWebsocketConnection *ws_conn = NULL;
+static SoupWebsocketConnection *ws_conn = nullptr;
 
 class WebsocketSignalingConnection : public ISignalingConnection
 {
@@ -362,7 +362,7 @@ protected:
             return;
         case SOUP_WEBSOCKET_DATA_TEXT: {
             gsize size;
-            const gchar *data = static_cast<const gchar *>(g_bytes_get_data(message, &size));
+            const auto *data = static_cast<const gchar *>(g_bytes_get_data(message, &size));
             /* Convert to NULL-terminated string */
             text = g_strndup(data, size);
             break;
@@ -416,7 +416,7 @@ protected:
     }
 
     static gboolean
-        register_with_server(void)
+        register_with_server()
     {
         gchar *hello;
 
@@ -451,7 +451,7 @@ protected:
         on_server_connected(SoupSession * session, GAsyncResult * res,
             SoupMessage * msg)
     {
-        GError *error = NULL;
+        GError *error = nullptr;
 
         ws_conn = soup_session_websocket_connect_finish(session, res, &error);
         if (error) {
@@ -480,7 +480,7 @@ protected:
         SoupLogger *logger;
         SoupMessage *message;
         SoupSession *session;
-        const char *https_aliases[] = { "wss", NULL };
+        const char *https_aliases[] = { "wss", nullptr };
 
         session =
             soup_session_new_with_options(SOUP_SESSION_SSL_STRICT, !disable_ssl,
@@ -497,7 +497,7 @@ protected:
         gst_print("Connecting to server...\n");
 
         /* Once connected, we will register */
-        soup_session_websocket_connect_async(session, message, NULL, NULL, NULL,
+        soup_session_websocket_connect_async(session, message, nullptr, nullptr, nullptr,
             (GAsyncReadyCallback)on_server_connected, message);
         app_state = SERVER_CONNECTING;
 
@@ -539,7 +539,7 @@ get_string_from_json_object (JsonObject * object)
   root = json_node_init_object (json_node_alloc (), object);
   generator = json_generator_new ();
   json_generator_set_root (generator, root);
-  text = json_generator_to_data (generator, NULL);
+  text = json_generator_to_data (generator, nullptr);
 
   /* Release everything */
   g_object_unref (generator);
@@ -557,17 +557,17 @@ handle_media_stream (GstPad * pad, GstElement * pipe, const char *convert_name,
 
   gst_println ("Trying to handle stream with %s ! %s", convert_name, sink_name);
 
-  q = gst_element_factory_make ("queue", NULL);
+  q = gst_element_factory_make ("queue", nullptr);
   g_assert_nonnull (q);
-  conv = gst_element_factory_make (convert_name, NULL);
+  conv = gst_element_factory_make (convert_name, nullptr);
   g_assert_nonnull (conv);
-  sink = gst_element_factory_make (sink_name, NULL);
+  sink = gst_element_factory_make (sink_name, nullptr);
   g_assert_nonnull (sink);
 
   if (g_strcmp0 (convert_name, "audioconvert") == 0) {
     /* Might also need to resample, so add it just in case.
      * Will be a no-op if it's not required. */
-    resample = gst_element_factory_make ("audioresample", NULL);
+    resample = gst_element_factory_make ("audioresample", nullptr);
     g_assert_nonnull (resample);
     gst_bin_add_many (GST_BIN (pipe), q, conv, resample, sink, NULL);
     gst_element_sync_state_with_parent (q);
@@ -623,7 +623,7 @@ on_incoming_stream (GstElement * webrtc, GstPad * pad, GstElement * pipe)
   if (GST_PAD_DIRECTION (pad) != GST_PAD_SRC)
     return;
 
-  decodebin = gst_element_factory_make ("decodebin", NULL);
+  decodebin = gst_element_factory_make ("decodebin", nullptr);
   g_signal_connect (decodebin, "pad-added",
       G_CALLBACK (on_incoming_decodebin_stream), pipe);
   gst_bin_add (GST_BIN (pipe), decodebin);
@@ -699,7 +699,7 @@ send_sdp_to_peer (GstWebRTCSessionDescription * desc)
 static void
 on_offer_created (GstPromise * promise, gpointer user_data)
 {
-  GstWebRTCSessionDescription *offer = NULL;
+  GstWebRTCSessionDescription *offer = nullptr;
   const GstStructure *reply;
 
   g_assert_cmphex (app_state, ==, PEER_CALL_NEGOTIATING);
@@ -730,7 +730,7 @@ on_negotiation_needed (GstElement * element, gpointer user_data)
       signaling_connection->signaling_connection_send_text("OFFER_REQUEST");
   } else if (create_offer) {
     GstPromise *promise =
-        gst_promise_new_with_change_func (on_offer_created, NULL, NULL);
+        gst_promise_new_with_change_func (on_offer_created, nullptr, nullptr);
     g_signal_emit_by_name (webrtc1, "create-offer", NULL, promise);
   }
 }
@@ -834,7 +834,7 @@ on_webrtcbin_get_stats (GstPromise * promise, GstElement * webrtcbin)
   g_return_if_fail (gst_promise_wait (promise) == GST_PROMISE_RESULT_REPLIED);
 
   stats = gst_promise_get_reply (promise);
-  gst_structure_foreach (stats, on_webrtcbin_stat, NULL);
+  gst_structure_foreach (stats, on_webrtcbin_stat, nullptr);
 
   g_timeout_add (100, (GSourceFunc) webrtcbin_get_stats, webrtcbin);
 }
@@ -846,7 +846,7 @@ webrtcbin_get_stats (GstElement * webrtcbin)
 
   promise =
       gst_promise_new_with_change_func (
-      (GstPromiseChangeFunc) on_webrtcbin_get_stats, webrtcbin, NULL);
+      (GstPromiseChangeFunc) on_webrtcbin_get_stats, webrtcbin, nullptr);
 
   GST_TRACE ("emitting get-stats on %" GST_PTR_FORMAT, webrtcbin);
   g_signal_emit_by_name (webrtcbin, "get-stats", NULL, promise);
@@ -861,7 +861,7 @@ static gboolean
 start_pipeline (gboolean create_offer)
 {
   GstStateChangeReturn ret;
-  GError *error = NULL;
+  GError *error = nullptr;
 
   pipe1 =
       gst_parse_launch (("webrtcbin bundle-policy=max-bundle name=sendrecv "
@@ -962,7 +962,7 @@ err:
   if (pipe1)
     g_clear_object (&pipe1);
   if (webrtc1)
-    webrtc1 = NULL;
+    webrtc1 = nullptr;
   return FALSE;
 }
 
@@ -971,7 +971,7 @@ err:
 static void
 on_answer_created (GstPromise * promise, gpointer user_data)
 {
-  GstWebRTCSessionDescription *answer = NULL;
+  GstWebRTCSessionDescription *answer = nullptr;
   const GstStructure *reply;
 
   g_assert_cmphex (app_state, ==, PEER_CALL_NEGOTIATING);
@@ -996,14 +996,14 @@ static void
 on_offer_set (GstPromise * promise, gpointer user_data)
 {
   gst_promise_unref (promise);
-  promise = gst_promise_new_with_change_func (on_answer_created, NULL, NULL);
+  promise = gst_promise_new_with_change_func (on_answer_created, nullptr, nullptr);
   g_signal_emit_by_name (webrtc1, "create-answer", NULL, promise);
 }
 
 static void
 on_offer_received (GstSDPMessage * sdp)
 {
-  GstWebRTCSessionDescription *offer = NULL;
+  GstWebRTCSessionDescription *offer = nullptr;
   GstPromise *promise;
 
   offer = gst_webrtc_session_description_new (GST_WEBRTC_SDP_TYPE_OFFER, sdp);
@@ -1011,7 +1011,7 @@ on_offer_received (GstSDPMessage * sdp)
 
   /* Set remote description on our pipeline */
   {
-    promise = gst_promise_new_with_change_func (on_offer_set, NULL, NULL);
+    promise = gst_promise_new_with_change_func (on_offer_set, nullptr, nullptr);
     g_signal_emit_by_name (webrtc1, "set-remote-description", offer, promise);
   }
   gst_webrtc_session_description_free (offer);
@@ -1054,7 +1054,7 @@ static void on_server_message(const gchar *text) {
     JsonNode *root;
     JsonObject *object, *child;
     JsonParser *parser = json_parser_new ();
-    if (!json_parser_load_from_data (parser, text, -1, NULL)) {
+    if (!json_parser_load_from_data (parser, text, -1, nullptr)) {
       gst_printerr ("Unknown message '%s', ignoring\n", text);
       g_object_unref (parser);
       return;
@@ -1151,13 +1151,13 @@ static void on_server_message(const gchar *text) {
 
 
 static gboolean
-check_plugins (void)
+check_plugins ()
 {
   gboolean ret;
   GstPlugin *plugin;
   GstRegistry *registry;
   const gchar *needed[] = { "opus", "vpx", "nice", "webrtc", "dtls", "srtp",
-    "rtpmanager", "videotestsrc", "audiotestsrc", NULL
+    "rtpmanager", "videotestsrc", "audiotestsrc", nullptr
   };
 
   registry = gst_registry_get ();
@@ -1178,11 +1178,11 @@ int
 main (int argc, char *argv[])
 {
   GOptionContext *context;
-  GError *error = NULL;
+  GError *error = nullptr;
   int ret_code = -1;
 
   context = g_option_context_new ("- gstreamer webrtc sendrecv demo");
-  g_option_context_add_main_entries (context, entries, NULL);
+  g_option_context_add_main_entries (context, entries, nullptr);
   g_option_context_add_group (context, gst_init_get_option_group ());
   if (!g_option_context_parse (context, &argc, &argv, &error)) {
     gst_printerr ("Error initializing: %s\n", error->message);
@@ -1233,7 +1233,7 @@ main (int argc, char *argv[])
 
   ret_code = 0;
 
-  loop = g_main_loop_new (NULL, FALSE);
+  loop = g_main_loop_new (nullptr, FALSE);
 
   signaling_connection->connect_to_signaling_server_async();
 
