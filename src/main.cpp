@@ -1218,19 +1218,19 @@ main (int argc, char *argv[])
     goto out;
   }
 
-#endif
-
-  ret_code = 0;
-
   /* Disable ssl when running a localhost server, because
    * it's probably a test server with a self-signed certificate */
   {
-    GstUri *uri = gst_uri_from_string (server_url);
-    if (g_strcmp0 ("localhost", gst_uri_get_host (uri)) == 0 ||
-        g_strcmp0 ("127.0.0.1", gst_uri_get_host (uri)) == 0)
-      disable_ssl = TRUE;
-    gst_uri_unref (uri);
+      GstUri *uri = gst_uri_from_string(server_url);
+      if (g_strcmp0("localhost", gst_uri_get_host(uri)) == 0 ||
+          g_strcmp0("127.0.0.1", gst_uri_get_host(uri)) == 0)
+          disable_ssl = TRUE;
+      gst_uri_unref(uri);
   }
+
+#endif
+
+  ret_code = 0;
 
   loop = g_main_loop_new (NULL, FALSE);
 
