@@ -13,18 +13,11 @@
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
 
-#define USE_NTFY 0
 
 /* For signalling */
-#if USE_NTFY
-
 #include "http.h"
 
-#else
-
 #include <libsoup/soup.h>
-
-#endif
 
 #include <json-glib/json-glib.h>
 
@@ -38,7 +31,7 @@
 
 #include <future>
 #include <atomic>
-
+#include <memory>
 
 enum AppState
 {
@@ -71,11 +64,7 @@ static GObject *send_channel, *receive_channel;
 static AppState app_state = APP_STATE_UNKNOWN;
 
 
-#if USE_NTFY
-
 static gchar *session_id = nullptr;
-
-#else
 
 static gchar *peer_id = NULL;
 static gchar *our_id = NULL;
@@ -84,21 +73,14 @@ static const gchar *server_url = "wss://webrtc.nirbheek.in:8443";
 static gboolean disable_ssl = FALSE;
 
 
-#endif
-
 static gboolean autovideosrc = FALSE;
 static gboolean autoaudiosrc = FALSE;
 
 static gboolean remote_is_offerer = FALSE;
 
 static GOptionEntry entries[] = {
-
-#if USE_NTFY
-
   {"session-id", 0, 0, G_OPTION_ARG_STRING, &session_id,
       "String ID of the session that peer can connect to", "ID"},
-
-#else
 
   {"peer-id", 0, 0, G_OPTION_ARG_STRING, &peer_id,
         "String ID of the peer to connect to", "ID"},
@@ -107,8 +89,6 @@ static GOptionEntry entries[] = {
   {"server", 0, 0, G_OPTION_ARG_STRING, &server_url,
         "Signalling server to connect to", "URL"},
   {"disable-ssl", 0, 0, G_OPTION_ARG_NONE, &disable_ssl, "Disable ssl", NULL},
-
-#endif
 
   {"autovideosrc", 0, 0, G_OPTION_ARG_NONE, &autovideosrc, "Use autovideosrc", NULL},
   {"autoaudiosrc", 0, 0, G_OPTION_ARG_NONE, &autoaudiosrc, "Use autoaudiosrc", NULL},
@@ -130,7 +110,15 @@ start_pipeline(gboolean create_offer);
 
 ////////////////////////////////////////////////////////////////////
 
-#if USE_NTFY
+struct ISignalingConnection {
+    virtual bool connect_to_signaling_server_async() = 0;
+    virtual bool we_create_offer() = 0;
+    virtual void signaling_connection_send_text(gchar *text) = 0;
+    virtual void close_signaling_connection() = 0;
+};
+
+std::unique_ptr<ISignalingConnection> signaling_connection;
+
 
 const xg::Guid this_guid = xg::newGuid();
 
@@ -144,377 +132,379 @@ const char send_message_url[] = "https://ntfy.sh/mediaThorSendRecv_%s";
 const char recv_message_url[] = "https://ntfy.sh/mediaThorSendRecv_%s/sse";
 
 
-static bool we_create_offer()
+class NtfySignalingConnection : public ISignalingConnection
 {
-    return this_guid.bytes() < their_giud.bytes();
-}
+protected:
+    bool we_create_offer() override
+    {
+        return this_guid.bytes() < their_giud.bytes();
+    }
 
+    void signaling_connection_send_text(gchar *text) override
+    {
+        const auto message = this_guid.str() + '\n' + text;
 
-static void signaling_connection_send_text(gchar *text)
-{
-    const auto message = this_guid.str() + '\n' + text;
+        char buffer[1024];
+        sprintf(buffer, send_message_url, session_id);
+        http(HTTP_POST, buffer, nullptr, message.c_str(), message.length());
+    }
 
-    char buffer[1024];
-    sprintf(buffer, send_message_url, session_id);
-    http(HTTP_POST, buffer, nullptr, message.c_str(), message.length());
-}
-
-static const char* verify_sse_response(CURL* curl) {
+    static const char* verify_sse_response(CURL* curl) {
 #define EXPECTED_CONTENT_TYPE "text/event-stream"
 
-    static const char expected_content_type[] = EXPECTED_CONTENT_TYPE;
+        static const char expected_content_type[] = EXPECTED_CONTENT_TYPE;
 
-    const char* content_type;
-    curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
-    if (!content_type) content_type = "";
+        const char* content_type;
+        curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &content_type);
+        if (!content_type) content_type = "";
 
-    if (!strncmp(content_type, expected_content_type, strlen(expected_content_type)))
-        return 0;
+        if (!strncmp(content_type, expected_content_type, strlen(expected_content_type)))
+            return 0;
 
-    return "Invalid content_type, should be '" EXPECTED_CONTENT_TYPE "'.";
-}
+        return "Invalid content_type, should be '" EXPECTED_CONTENT_TYPE "'.";
+    }
 
-static bool connect_to_signaling_server_async()
-{
-    std::promise<bool> startedPromise;
+    bool connect_to_signaling_server_async() override
+    {
+        std::promise<bool> startedPromise;
 
-    auto startedResult = startedPromise.get_future();
+        auto startedResult = startedPromise.get_future();
 
-    auto threadLam = [](
-        std::promise<bool> startedPromise
-        ) {
-            const char* headers[] = {
-                "Accept: text/event-stream",
-                NULL
-            };
+        auto threadLam = [this](
+            std::promise<bool> startedPromise
+            ) {
+                const char* headers[] = {
+                    "Accept: text/event-stream",
+                    NULL
+                };
 
-            auto on_data = [&startedPromise](char *ptr, size_t size, size_t nmemb)->size_t {
-                try {
-                    const auto ptrEnd = ptr + size * nmemb;
+                auto on_data = [this, &startedPromise](char *ptr, size_t size, size_t nmemb)->size_t {
+                    try {
+                        const auto ptrEnd = ptr + size * nmemb;
 
-                    const char watch[] = "data:";
+                        const char watch[] = "data:";
 
-                    auto pData = std::search(ptr, ptrEnd, std::begin(watch), std::prev(std::end(watch)));
-                    if (pData != ptrEnd) do {
-                        pData += sizeof(watch) / sizeof(watch[0]) - 1;
+                        auto pData = std::search(ptr, ptrEnd, std::begin(watch), std::prev(std::end(watch)));
+                        if (pData != ptrEnd) do {
+                            pData += sizeof(watch) / sizeof(watch[0]) - 1;
 
-                        JsonParser *parser = json_parser_new();
-                        if (!json_parser_load_from_data(parser, pData, ptrEnd - pData, NULL)) {
-                            //gst_printerr("Unknown message '%s', ignoring\n", text);
-                            g_object_unref(parser);
-                            break; //goto out;
-                        }
+                            JsonParser *parser = json_parser_new();
+                            if (!json_parser_load_from_data(parser, pData, ptrEnd - pData, NULL)) {
+                                //gst_printerr("Unknown message '%s', ignoring\n", text);
+                                g_object_unref(parser);
+                                break; //goto out;
+                            }
 
-                        auto root = json_parser_get_root(parser);
-                        if (!JSON_NODE_HOLDS_OBJECT(root)) {
-                            //gst_printerr("Unknown json message '%s', ignoring\n", text);
-                            g_object_unref(parser);
-                            break; //goto out;
-                        }
+                            auto root = json_parser_get_root(parser);
+                            if (!JSON_NODE_HOLDS_OBJECT(root)) {
+                                //gst_printerr("Unknown json message '%s', ignoring\n", text);
+                                g_object_unref(parser);
+                                break; //goto out;
+                            }
 
-                        auto child = json_node_get_object(root);
+                            auto child = json_node_get_object(root);
 
-                        if (!json_object_has_member(child, "event")) {
-                            g_object_unref(parser);
-                            break; //goto out;
-                        }
+                            if (!json_object_has_member(child, "event")) {
+                                g_object_unref(parser);
+                                break; //goto out;
+                            }
 
-                        auto sdptype = json_object_get_string_member(child, "event");
-                        if (g_str_equal(sdptype, "open")) {
-                            startedPromise.set_value(true);
-                        }
-                        else if (g_str_equal(sdptype, "message")) {
-                            auto text = json_object_get_string_member(child, "message");
+                            auto sdptype = json_object_get_string_member(child, "event");
+                            if (g_str_equal(sdptype, "open")) {
+                                startedPromise.set_value(true);
+                            }
+                            else if (g_str_equal(sdptype, "message")) {
+                                auto text = json_object_get_string_member(child, "message");
 
-                            if (auto pos = strchr(text, '\n'); pos != nullptr && pos != text)
-                            {
-                                std::string_view sender_guid(text, pos - text);
-                                if (this_guid.str() != sender_guid)
+                                if (auto pos = strchr(text, '\n'); pos != nullptr && pos != text)
                                 {
-                                    if (!their_giud.isValid())
-                                        their_giud = std::string(sender_guid);
+                                    std::string_view sender_guid(text, pos - text);
+                                    if (this_guid.str() != sender_guid)
+                                    {
+                                        if (!their_giud.isValid())
+                                            their_giud = std::string(sender_guid);
 
-                                    const auto message = pos + 1;
-                                    const bool is_syn = g_strcmp0(message, "SYN") == 0;
-                                    if (is_syn)
-                                        signaling_connection_send_text("ACK");
+                                        const auto message = pos + 1;
+                                        const bool is_syn = g_strcmp0(message, "SYN") == 0;
+                                        if (is_syn)
+                                            signaling_connection_send_text("ACK");
 
-                                    if (is_syn || g_strcmp0(message, "ACK") == 0) {
-                                        if (app_state < PEER_CONNECTED) {
-                                            app_state = PEER_CONNECTED;
-                                            /* Start negotiation (exchange SDP and ICE candidates) */
-                                            if (we_create_offer() && !start_pipeline(TRUE))
-                                                cleanup_and_quit_loop("ERROR: failed to start pipeline",
-                                                    PEER_CALL_ERROR);
+                                        if (is_syn || g_strcmp0(message, "ACK") == 0) {
+                                            if (app_state < PEER_CONNECTED) {
+                                                app_state = PEER_CONNECTED;
+                                                /* Start negotiation (exchange SDP and ICE candidates) */
+                                                if (we_create_offer() && !start_pipeline(TRUE))
+                                                    cleanup_and_quit_loop("ERROR: failed to start pipeline",
+                                                        PEER_CALL_ERROR);
+                                            }
                                         }
+                                        else
+                                            on_server_message(message);
                                     }
-                                    else
-                                        on_server_message(message);
                                 }
                             }
-                        }
 
-                        g_object_unref(parser);
+                            g_object_unref(parser);
 
-                    } while (false);
-                }
-                catch (const std::exception&) {
-                    startedPromise.set_value(false);
-                    requestInterrupted = true;
-                }
-                return size * nmemb;
-            };
+                        } while (false);
+                    }
+                    catch (const std::exception&) {
+                        startedPromise.set_value(false);
+                        requestInterrupted = true;
+                    }
+                    return size * nmemb;
+                };
 
-            auto progress_callback = [](curl_off_t dltotal,
-                curl_off_t dlnow,
-                curl_off_t ultotal,
-                curl_off_t ulnow)->size_t {
-                    return requestInterrupted;
-            };
+                auto progress_callback = [](curl_off_t dltotal,
+                    curl_off_t dlnow,
+                    curl_off_t ultotal,
+                    curl_off_t ulnow)->size_t {
+                        return requestInterrupted;
+                };
 
-            char buffer[1024];
-            sprintf(buffer, recv_message_url, session_id);
-            http(HTTP_GET, buffer, headers, 0, 0, on_data, verify_sse_response, progress_callback);
-    };
+                char buffer[1024];
+                sprintf(buffer, recv_message_url, session_id);
+                http(HTTP_GET, buffer, headers, 0, 0, on_data, verify_sse_response, progress_callback);
+        };
 
-    // https://stackoverflow.com/a/23454840/10472202
-    signaling_runner = std::thread(threadLam, std::move(startedPromise));
+        // https://stackoverflow.com/a/23454840/10472202
+        signaling_runner = std::thread(threadLam, std::move(startedPromise));
 
-    if (!startedResult.get())
-        return false;
+        if (!startedResult.get())
+            return false;
 
-    signaling_connection_send_text("SYN");
+        signaling_connection_send_text("SYN");
 
-    return true;
-}
-
-static void close_signaling_connection()
-{
-    if (signaling_runner.joinable())
-    {
-        requestInterrupted = true;
-        signaling_runner.join();
+        return true;
     }
-}
 
+    void close_signaling_connection() override
+    {
+        if (signaling_runner.joinable())
+        {
+            requestInterrupted = true;
+            signaling_runner.join();
+        }
+    }
+};
 
-#else
 
 static SoupWebsocketConnection *ws_conn = NULL;
 
-static bool we_create_offer()
+class WebsocketSignalingConnection : public ISignalingConnection
 {
-    return !our_id;
-}
+protected:
 
-static void close_signaling_connection()
-{
-    if (ws_conn) {
-        if (soup_websocket_connection_get_state(ws_conn) ==
-            SOUP_WEBSOCKET_STATE_OPEN)
-            /* This will call us again */
-            soup_websocket_connection_close(ws_conn, 1000, "");
-        else
-            g_clear_object(&ws_conn);
-    }
-}
-
-static void signaling_connection_send_text(gchar *text)
-{
-    soup_websocket_connection_send_text(ws_conn, text);
-}
-
-static bool signaling_connection_is_open()
-{
-    return soup_websocket_connection_get_state(ws_conn) ==
-        SOUP_WEBSOCKET_STATE_OPEN;
-}
-
-static void
-soup_websocket_on_server_closed(SoupWebsocketConnection * conn G_GNUC_UNUSED,
-    gpointer user_data G_GNUC_UNUSED)
-{
-    app_state = SERVER_CLOSED;
-    cleanup_and_quit_loop("Server connection closed", APP_STATE_UNKNOWN);
-}
-
-
-static gboolean
-setup_call(void)
-{
-    gchar *msg;
-
-    if (!signaling_connection_is_open())
-        return FALSE;
-
-    if (!peer_id)
-        return FALSE;
-
-    gst_print("Setting up signalling server call with %s\n", peer_id);
-    app_state = PEER_CONNECTING;
-    msg = g_strdup_printf("SESSION %s", peer_id);
-    signaling_connection_send_text(msg);
-    g_free(msg);
-    return TRUE;
-}
-
-
-static void
-soup_websocket_on_server_message(SoupWebsocketConnection * conn, SoupWebsocketDataType type,
-    GBytes * message, gpointer user_data)
-{
-    gchar *text;
-
-    switch (type) {
-    case SOUP_WEBSOCKET_DATA_BINARY:
-        gst_printerr("Received unknown binary message, ignoring\n");
-        return;
-    case SOUP_WEBSOCKET_DATA_TEXT: {
-        gsize size;
-        const gchar *data = static_cast<const gchar *>(g_bytes_get_data(message, &size));
-        /* Convert to NULL-terminated string */
-        text = g_strndup(data, size);
-        break;
-    }
-    default:
-        g_assert_not_reached();
+    bool we_create_offer() override
+    {
+        return !our_id;
     }
 
-    if (g_strcmp0(text, "HELLO") == 0) {
-        /* Server has accepted our registration, we are ready to send commands */
-        if (app_state != SERVER_REGISTERING) {
-            cleanup_and_quit_loop("ERROR: Received HELLO when not registering",
-                APP_STATE_ERROR);
-            g_free(text);
-            return;
+    void close_signaling_connection() override
+    {
+        if (ws_conn) {
+            if (soup_websocket_connection_get_state(ws_conn) ==
+                SOUP_WEBSOCKET_STATE_OPEN)
+                /* This will call us again */
+                soup_websocket_connection_close(ws_conn, 1000, "");
+            else
+                g_clear_object(&ws_conn);
         }
-        app_state = SERVER_REGISTERED;
-        gst_print("Registered with server\n");
-        if (!our_id) {
-            /* Ask signalling server to connect us with a specific peer */
-            if (!setup_call()) {
-                cleanup_and_quit_loop("ERROR: Failed to setup call", PEER_CALL_ERROR);
+    }
+
+    void signaling_connection_send_text(gchar *text) override
+    {
+        soup_websocket_connection_send_text(ws_conn, text);
+    }
+
+    static bool signaling_connection_is_open()
+    {
+        return soup_websocket_connection_get_state(ws_conn) ==
+            SOUP_WEBSOCKET_STATE_OPEN;
+    }
+
+    static void
+        soup_websocket_on_server_closed(SoupWebsocketConnection * conn G_GNUC_UNUSED,
+            gpointer user_data G_GNUC_UNUSED)
+    {
+        app_state = SERVER_CLOSED;
+        cleanup_and_quit_loop("Server connection closed", APP_STATE_UNKNOWN);
+    }
+
+    static gboolean setup_call()
+    {
+        gchar *msg;
+
+        if (!signaling_connection_is_open())
+            return FALSE;
+
+        if (!peer_id)
+            return FALSE;
+
+        gst_print("Setting up signalling server call with %s\n", peer_id);
+        app_state = PEER_CONNECTING;
+        msg = g_strdup_printf("SESSION %s", peer_id);
+        soup_websocket_connection_send_text(ws_conn, msg);
+        g_free(msg);
+        return TRUE;
+    }
+
+
+    static void
+        soup_websocket_on_server_message(SoupWebsocketConnection * conn, SoupWebsocketDataType type,
+            GBytes * message, gpointer user_data)
+    {
+        gchar *text;
+
+        switch (type) {
+        case SOUP_WEBSOCKET_DATA_BINARY:
+            gst_printerr("Received unknown binary message, ignoring\n");
+            return;
+        case SOUP_WEBSOCKET_DATA_TEXT: {
+            gsize size;
+            const gchar *data = static_cast<const gchar *>(g_bytes_get_data(message, &size));
+            /* Convert to NULL-terminated string */
+            text = g_strndup(data, size);
+            break;
+        }
+        default:
+            g_assert_not_reached();
+        }
+
+        if (g_strcmp0(text, "HELLO") == 0) {
+            /* Server has accepted our registration, we are ready to send commands */
+            if (app_state != SERVER_REGISTERING) {
+                cleanup_and_quit_loop("ERROR: Received HELLO when not registering",
+                    APP_STATE_ERROR);
                 g_free(text);
                 return;
             }
+            app_state = SERVER_REGISTERED;
+            gst_print("Registered with server\n");
+            if (!our_id) {
+                /* Ask signalling server to connect us with a specific peer */
+                if (!setup_call()) {
+                    cleanup_and_quit_loop("ERROR: Failed to setup call", PEER_CALL_ERROR);
+                    g_free(text);
+                    return;
+                }
+            }
+            else {
+                gst_println("Waiting for connection from peer (our-id: %s)", our_id);
+            }
+        }
+        else if (g_strcmp0(text, "SESSION_OK") == 0) {
+            /* The call initiated by us has been setup by the server; now we can start
+             * negotiation */
+            if (app_state != PEER_CONNECTING) {
+                cleanup_and_quit_loop("ERROR: Received SESSION_OK when not calling",
+                    PEER_CONNECTION_ERROR);
+                g_free(text);
+                return;
+            }
+
+            app_state = PEER_CONNECTED;
+            /* Start negotiation (exchange SDP and ICE candidates) */
+            if (!start_pipeline(TRUE))
+                cleanup_and_quit_loop("ERROR: failed to start pipeline",
+                    PEER_CALL_ERROR);
+        }
+        else
+            on_server_message(text);
+
+        g_free(text);
+    }
+
+    static gboolean
+        register_with_server(void)
+    {
+        gchar *hello;
+
+        if (!signaling_connection_is_open())
+            return FALSE;
+
+        if (!our_id) {
+            gint32 id;
+
+            id = g_random_int_range(10, 10000);
+            gst_print("Registering id %i with server\n", id);
+
+            hello = g_strdup_printf("HELLO %i", id);
         }
         else {
-            gst_println("Waiting for connection from peer (our-id: %s)", our_id);
+            gst_print("Registering id %s with server\n", our_id);
+
+            hello = g_strdup_printf("HELLO %s", our_id);
         }
+
+        app_state = SERVER_REGISTERING;
+
+        /* Register with the server with a random integer id. Reply will be received
+         * by on_server_message() */
+        soup_websocket_connection_send_text(ws_conn, hello);
+        g_free(hello);
+
+        return TRUE;
     }
-    else if (g_strcmp0(text, "SESSION_OK") == 0) {
-        /* The call initiated by us has been setup by the server; now we can start
-         * negotiation */
-        if (app_state != PEER_CONNECTING) {
-            cleanup_and_quit_loop("ERROR: Received SESSION_OK when not calling",
-                PEER_CONNECTION_ERROR);
-            g_free(text);
+
+    static void
+        on_server_connected(SoupSession * session, GAsyncResult * res,
+            SoupMessage * msg)
+    {
+        GError *error = NULL;
+
+        ws_conn = soup_session_websocket_connect_finish(session, res, &error);
+        if (error) {
+            cleanup_and_quit_loop(error->message, SERVER_CONNECTION_ERROR);
+            g_error_free(error);
             return;
         }
 
-        app_state = PEER_CONNECTED;
-        /* Start negotiation (exchange SDP and ICE candidates) */
-        if (!start_pipeline(TRUE))
-            cleanup_and_quit_loop("ERROR: failed to start pipeline",
-                PEER_CALL_ERROR);
-    }
-    else 
-        on_server_message(text);
+        g_assert_nonnull(ws_conn);
 
-    g_free(text);
-}
+        app_state = SERVER_CONNECTED;
+        gst_print("Connected to signalling server\n");
 
-static gboolean
-register_with_server(void)
-{
-    gchar *hello;
+        g_signal_connect(ws_conn, "closed", G_CALLBACK(soup_websocket_on_server_closed), NULL);
+        g_signal_connect(ws_conn, "message", G_CALLBACK(soup_websocket_on_server_message), NULL);
 
-    if (!signaling_connection_is_open())
-        return FALSE;
-
-    if (!our_id) {
-        gint32 id;
-
-        id = g_random_int_range(10, 10000);
-        gst_print("Registering id %i with server\n", id);
-
-        hello = g_strdup_printf("HELLO %i", id);
-    }
-    else {
-        gst_print("Registering id %s with server\n", our_id);
-
-        hello = g_strdup_printf("HELLO %s", our_id);
+        /* Register with the server so it knows about us and can accept commands */
+        register_with_server();
     }
 
-    app_state = SERVER_REGISTERING;
+    /*
+     * Connect to the signalling server. This is the entrypoint for everything else.
+     */
+    bool connect_to_signaling_server_async() override
+    {
+        SoupLogger *logger;
+        SoupMessage *message;
+        SoupSession *session;
+        const char *https_aliases[] = { "wss", NULL };
 
-    /* Register with the server with a random integer id. Reply will be received
-     * by on_server_message() */
-    signaling_connection_send_text(hello);
-    g_free(hello);
+        session =
+            soup_session_new_with_options(SOUP_SESSION_SSL_STRICT, !disable_ssl,
+                SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE,
+                //SOUP_SESSION_SSL_CA_FILE, "/etc/ssl/certs/ca-bundle.crt",
+                SOUP_SESSION_HTTPS_ALIASES, https_aliases, NULL);
 
-    return TRUE;
-}
+        logger = soup_logger_new(SOUP_LOGGER_LOG_BODY, -1);
+        soup_session_add_feature(session, SOUP_SESSION_FEATURE(logger));
+        g_object_unref(logger);
 
-static void
-on_server_connected(SoupSession * session, GAsyncResult * res,
-    SoupMessage * msg)
-{
-    GError *error = NULL;
+        message = soup_message_new(SOUP_METHOD_GET, server_url);
 
-    ws_conn = soup_session_websocket_connect_finish(session, res, &error);
-    if (error) {
-        cleanup_and_quit_loop(error->message, SERVER_CONNECTION_ERROR);
-        g_error_free(error);
-        return;
+        gst_print("Connecting to server...\n");
+
+        /* Once connected, we will register */
+        soup_session_websocket_connect_async(session, message, NULL, NULL, NULL,
+            (GAsyncReadyCallback)on_server_connected, message);
+        app_state = SERVER_CONNECTING;
+
+        return true;
     }
 
-    g_assert_nonnull(ws_conn);
-
-    app_state = SERVER_CONNECTED;
-    gst_print("Connected to signalling server\n");
-
-    g_signal_connect(ws_conn, "closed", G_CALLBACK(soup_websocket_on_server_closed), NULL);
-    g_signal_connect(ws_conn, "message", G_CALLBACK(soup_websocket_on_server_message), NULL);
-
-    /* Register with the server so it knows about us and can accept commands */
-    register_with_server();
-}
-
-/*
- * Connect to the signalling server. This is the entrypoint for everything else.
- */
-static void
-connect_to_signaling_server_async(void)
-{
-    SoupLogger *logger;
-    SoupMessage *message;
-    SoupSession *session;
-    const char *https_aliases[] = { "wss", NULL };
-
-    session =
-        soup_session_new_with_options(SOUP_SESSION_SSL_STRICT, !disable_ssl,
-            SOUP_SESSION_SSL_USE_SYSTEM_CA_FILE, TRUE,
-            //SOUP_SESSION_SSL_CA_FILE, "/etc/ssl/certs/ca-bundle.crt",
-            SOUP_SESSION_HTTPS_ALIASES, https_aliases, NULL);
-
-    logger = soup_logger_new(SOUP_LOGGER_LOG_BODY, -1);
-    soup_session_add_feature(session, SOUP_SESSION_FEATURE(logger));
-    g_object_unref(logger);
-
-    message = soup_message_new(SOUP_METHOD_GET, server_url);
-
-    gst_print("Connecting to server...\n");
-
-    /* Once connected, we will register */
-    soup_session_websocket_connect_async(session, message, NULL, NULL, NULL,
-        (GAsyncReadyCallback)on_server_connected, message);
-    app_state = SERVER_CONNECTING;
-}
-
-#endif
-
-
+};
 
 ////////////////////////////////////////////////////////////////////
 
@@ -527,7 +517,7 @@ cleanup_and_quit_loop (const gchar * msg, enum AppState state)
   if (state > 0)
     app_state = state;
 
-  close_signaling_connection();
+  signaling_connection->close_signaling_connection();
 
   if (loop) {
     g_main_loop_quit (loop);
@@ -664,7 +654,7 @@ send_ice_candidate_message (GstElement * webrtc G_GNUC_UNUSED, guint mlineindex,
   text = get_string_from_json_object (msg);
   json_object_unref (msg);
 
-  signaling_connection_send_text(text);
+  signaling_connection->signaling_connection_send_text(text);
   g_free (text);
 }
 
@@ -701,7 +691,7 @@ send_sdp_to_peer (GstWebRTCSessionDescription * desc)
   text = get_string_from_json_object (msg);
   json_object_unref (msg);
 
-  signaling_connection_send_text(text);
+  signaling_connection->signaling_connection_send_text(text);
   g_free (text);
 }
 
@@ -737,7 +727,7 @@ on_negotiation_needed (GstElement * element, gpointer user_data)
   app_state = PEER_CALL_NEGOTIATING;
 
   if (remote_is_offerer) {
-      signaling_connection_send_text("OFFER_REQUEST");
+      signaling_connection->signaling_connection_send_text("OFFER_REQUEST");
   } else if (create_offer) {
     GstPromise *promise =
         gst_promise_new_with_change_func (on_offer_created, NULL, NULL);
@@ -1079,7 +1069,7 @@ static void on_server_message(const gchar *text) {
 
     /* If peer connection wasn't made yet and we are expecting peer will
      * connect to us, launch pipeline at this moment */
-    if (!webrtc1 && !we_create_offer()) {
+    if (!webrtc1 && !signaling_connection->we_create_offer()) {
       if (!start_pipeline (FALSE)) {
         cleanup_and_quit_loop ("ERROR: failed to start pipeline",
             PEER_CALL_ERROR);
@@ -1206,42 +1196,46 @@ main (int argc, char *argv[])
     goto out;
   }
 
-#if USE_NTFY
+  if (session_id) {
+      //gst_printerr("--session-id is a required argument\n");
+      //goto out;
 
-  if (!session_id) {
-      gst_printerr("--session-id is a required argument\n");
-      goto out;
+      if (peer_id || our_id) {
+          gst_printerr("specify only --session-id, neither --peer-id nor --our-id\n");
+          goto out;
+      }
+
+      signaling_connection = std::make_unique<NtfySignalingConnection>();
   }
+  else {
+      if (!peer_id && !our_id) {
+          gst_printerr("--peer-id or --our-id is a required argument\n");
+          goto out;
+      }
 
-#else
+      if (peer_id && our_id) {
+          gst_printerr("specify only --peer-id or --our-id\n");
+          goto out;
+      }
 
-  if (!peer_id && !our_id) {
-    gst_printerr ("--peer-id or --our-id is a required argument\n");
-    goto out;
+      signaling_connection = std::make_unique<WebsocketSignalingConnection>();
+
+      /* Disable ssl when running a localhost server, because
+       * it's probably a test server with a self-signed certificate */
+      {
+          GstUri *uri = gst_uri_from_string(server_url);
+          if (g_strcmp0("localhost", gst_uri_get_host(uri)) == 0 ||
+              g_strcmp0("127.0.0.1", gst_uri_get_host(uri)) == 0)
+              disable_ssl = TRUE;
+          gst_uri_unref(uri);
+      }
   }
-
-  if (peer_id && our_id) {
-    gst_printerr ("specify only --peer-id or --our-id\n");
-    goto out;
-  }
-
-  /* Disable ssl when running a localhost server, because
-   * it's probably a test server with a self-signed certificate */
-  {
-      GstUri *uri = gst_uri_from_string(server_url);
-      if (g_strcmp0("localhost", gst_uri_get_host(uri)) == 0 ||
-          g_strcmp0("127.0.0.1", gst_uri_get_host(uri)) == 0)
-          disable_ssl = TRUE;
-      gst_uri_unref(uri);
-  }
-
-#endif
 
   ret_code = 0;
 
   loop = g_main_loop_new (NULL, FALSE);
 
-  connect_to_signaling_server_async();
+  signaling_connection->connect_to_signaling_server_async();
 
   g_main_loop_run (loop);
 
@@ -1256,16 +1250,10 @@ main (int argc, char *argv[])
 
 out:
 
-#if USE_NTFY
-
   g_free(session_id);
-
-#else
 
   g_free (peer_id);
   g_free (our_id);
-
-#endif
 
   return ret_code;
 }
