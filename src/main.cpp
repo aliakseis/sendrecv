@@ -86,6 +86,9 @@ static gboolean disable_ssl = FALSE;
 
 #endif
 
+static gboolean autovideosrc = FALSE;
+static gboolean autoaudiosrc = FALSE;
+
 static gboolean remote_is_offerer = FALSE;
 
 static GOptionEntry entries[] = {
@@ -106,6 +109,9 @@ static GOptionEntry entries[] = {
   {"disable-ssl", 0, 0, G_OPTION_ARG_NONE, &disable_ssl, "Disable ssl", NULL},
 
 #endif
+
+  {"autovideosrc", 0, 0, G_OPTION_ARG_NONE, &autovideosrc, "Use autovideosrc", NULL},
+  {"autoaudiosrc", 0, 0, G_OPTION_ARG_NONE, &autoaudiosrc, "Use autoaudiosrc", NULL},
 
   {"remote-offerer", 0, 0, G_OPTION_ARG_NONE, &remote_is_offerer,
       "Request that the peer generate the offer and we'll answer", NULL},
@@ -870,8 +876,8 @@ start_pipeline (gboolean create_offer)
   pipe1 =
       gst_parse_launch (("webrtcbin bundle-policy=max-bundle name=sendrecv "
       STUN_SERVER
-      + std::string(create_offer ? "videotestsrc ! "
-          : "videotestsrc is-live=true pattern=ball foreground-color=123456 ! videoconvert ! queue ! ") +
+      + std::string(autovideosrc ? "autovideosrc " : "videotestsrc is-live=true pattern=ball") +
+      " ! videoconvert ! queue ! "
       /* increase the default keyframe distance, browsers have really long
        * periods between keyframes and rely on PLI events on packet loss to
        * fix corrupted video.
@@ -880,7 +886,8 @@ start_pipeline (gboolean create_offer)
       /* picture-id-mode=15-bit seems to make TWCC stats behave better */
       "rtpvp8pay name=videopay picture-id-mode=15-bit ! "
       "queue ! " RTP_CAPS_VP8 "96 ! sendrecv. "
-      "audiotestsrc is-live=true wave=red-noise ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay name=audiopay ! "
+      + std::string(autoaudiosrc? "autoaudiosrc" : "audiotestsrc is-live=true wave=red-noise") +
+      " ! audioconvert ! audioresample ! queue ! opusenc ! rtpopuspay name=audiopay ! "
       "queue ! " RTP_CAPS_OPUS "97 ! sendrecv. ").c_str(), &error);
 
   if (error) {
