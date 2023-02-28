@@ -111,10 +111,10 @@ start_pipeline(gboolean create_offer);
 ////////////////////////////////////////////////////////////////////
 
 struct ISignalingConnection {
-    virtual bool connect_to_signaling_server_async() = 0;
+    virtual bool connect_to_server_async() = 0;
     virtual bool we_create_offer() = 0;
-    virtual void signaling_connection_send_text(gchar *text) = 0;
-    virtual void close_signaling_connection() = 0;
+    virtual void send_text(gchar *text) = 0;
+    virtual void close() = 0;
 };
 
 std::unique_ptr<ISignalingConnection> signaling_connection;
@@ -140,7 +140,7 @@ protected:
         return this_guid.bytes() < their_giud.bytes();
     }
 
-    void signaling_connection_send_text(gchar *text) override
+    void send_text(gchar *text) override
     {
         const auto message = this_guid.str() + '\n' + text;
 
@@ -164,7 +164,7 @@ protected:
         return "Invalid content_type, should be '" EXPECTED_CONTENT_TYPE "'.";
     }
 
-    bool connect_to_signaling_server_async() override
+    bool connect_to_server_async() override
     {
         std::promise<bool> startedPromise;
 
@@ -227,7 +227,7 @@ protected:
                                         const auto message = pos + 1;
                                         const bool is_syn = g_strcmp0(message, "SYN") == 0;
                                         if (is_syn)
-                                            signaling_connection_send_text("ACK");
+                                            send_text("ACK");
 
                                         if (is_syn || g_strcmp0(message, "ACK") == 0) {
                                             if (app_state < PEER_CONNECTED) {
@@ -273,12 +273,12 @@ protected:
         if (!startedResult.get())
             return false;
 
-        signaling_connection_send_text("SYN");
+        send_text("SYN");
 
         return true;
     }
 
-    void close_signaling_connection() override
+    void close() override
     {
         if (signaling_runner.joinable())
         {
@@ -300,7 +300,7 @@ protected:
         return !our_id;
     }
 
-    void close_signaling_connection() override
+    void close() override
     {
         if (ws_conn) {
             if (soup_websocket_connection_get_state(ws_conn) ==
@@ -312,7 +312,7 @@ protected:
         }
     }
 
-    void signaling_connection_send_text(gchar *text) override
+    void send_text(gchar *text) override
     {
         soup_websocket_connection_send_text(ws_conn, text);
     }
@@ -475,7 +475,7 @@ protected:
     /*
      * Connect to the signalling server. This is the entrypoint for everything else.
      */
-    bool connect_to_signaling_server_async() override
+    bool connect_to_server_async() override
     {
         SoupLogger *logger;
         SoupMessage *message;
@@ -517,7 +517,7 @@ cleanup_and_quit_loop (const gchar * msg, enum AppState state)
   if (state > 0)
     app_state = state;
 
-  signaling_connection->close_signaling_connection();
+  signaling_connection->close();
 
   if (loop) {
     g_main_loop_quit (loop);
@@ -654,7 +654,7 @@ send_ice_candidate_message (GstElement * webrtc G_GNUC_UNUSED, guint mlineindex,
   text = get_string_from_json_object (msg);
   json_object_unref (msg);
 
-  signaling_connection->signaling_connection_send_text(text);
+  signaling_connection->send_text(text);
   g_free (text);
 }
 
@@ -691,7 +691,7 @@ send_sdp_to_peer (GstWebRTCSessionDescription * desc)
   text = get_string_from_json_object (msg);
   json_object_unref (msg);
 
-  signaling_connection->signaling_connection_send_text(text);
+  signaling_connection->send_text(text);
   g_free (text);
 }
 
@@ -727,7 +727,7 @@ on_negotiation_needed (GstElement * element, gpointer user_data)
   app_state = PEER_CALL_NEGOTIATING;
 
   if (remote_is_offerer) {
-      signaling_connection->signaling_connection_send_text("OFFER_REQUEST");
+      signaling_connection->send_text("OFFER_REQUEST");
   } else if (create_offer) {
     GstPromise *promise =
         gst_promise_new_with_change_func (on_offer_created, nullptr, nullptr);
@@ -1235,7 +1235,7 @@ main (int argc, char *argv[])
 
   loop = g_main_loop_new (nullptr, FALSE);
 
-  signaling_connection->connect_to_signaling_server_async();
+  signaling_connection->connect_to_server_async();
 
   g_main_loop_run (loop);
 
