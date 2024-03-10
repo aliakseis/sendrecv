@@ -7,27 +7,42 @@ set(CMAKE_CXX_STANDARD 17)
 
 
 # pkg-config を使ってモジュールを読み込む
-find_package(PkgConfig)
+#find_package(PkgConfig)
 
 # gstreamer-1.0 の存在チェック
-pkg_check_modules(GSTREAMER REQUIRED 
-  glib-2.0
-  json-glib-1.0
-  libsoup-2.4
-  gstreamer-1.0 
-  gstreamer-sdp-1.0
-  gstreamer-rtp-1.0
-  gstreamer-webrtc-1.0)
+#pkg_check_modules(GSTREAMER REQUIRED 
+#  glib-2.0
+#  json-glib-1.0
+#  libsoup-2.4
+#  gstreamer-1.0 
+#  gstreamer-sdp-1.0
+#  gstreamer-rtp-1.0
+#  gstreamer-webrtc-1.0)
 
 # gstreamer のヘッダーファイルへのパスを表示
-message("GSTREAMER_INCLUDE_DIRS: ${GSTREAMER_INCLUDE_DIRS}")
+#message("GSTREAMER_INCLUDE_DIRS: ${GSTREAMER_INCLUDE_DIRS}")
 
 # gstreamer のライブラリへのパスを表示
-message("GSTREAMER_LIBRARY_DIRS: ${GSTREAMER_LIBRARY_DIRS}")
+#message("GSTREAMER_LIBRARY_DIRS: ${GSTREAMER_LIBRARY_DIRS}")
 
 
 # gstreamermm のライブラリのパスを設定
-link_directories(${GSTREAMER_LIBRARY_DIRS})
+#link_directories(${GSTREAMER_LIBRARY_DIRS})
+
+
+
+
+include(cmake/detect_gstreamer.cmake)
+
+if (HAVE_GSTREAMER)
+	message ("    GStreamer: (${GSTREAMER_VERSION})")
+	message ("    GStreamer include dirs: (${GSTREAMER_INCLUDE_DIRS})")
+else()
+	message( FATAL_ERROR "GStreamer not found." )
+endif()
+
+
+
 
 find_package(crossguid CONFIG REQUIRED)
 

@@ -224,7 +224,7 @@ protected:
                                     if (this_guid.str() != sender_guid)
                                     {
                                         if (!their_giud.isValid())
-                                            their_giud = std::string(sender_guid);
+                                            their_giud = xg::Guid{ sender_guid };
 
                                         const auto message = pos + 1;
                                         const bool is_syn = g_strcmp0(message, "SYN") == 0;
