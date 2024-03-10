@@ -59,7 +59,7 @@ GST_DEBUG_CATEGORY_STATIC (GST_CAT_DEFAULT);
 
 static GMainLoop *loop;
 static GstElement *pipe1, *webrtc1 = nullptr;
-static GObject *send_channel, *receive_channel;
+static GObject* send_channel, *receive_channel;
 
 static AppState app_state = APP_STATE_UNKNOWN;
 
@@ -1018,8 +1018,8 @@ start_pipeline (gboolean create_offer)
     gst_print ("Could not create data channel, is usrsctp available?\n");
   }
 
-  g_signal_connect (webrtc1, "on-data-channel", G_CALLBACK (on_data_channel),
-      NULL);
+  g_signal_connect (webrtc1, "on-data-channel", G_CALLBACK (on_data_channel), NULL);
+
   /* Incoming streams will be exposed via this signal */
   g_signal_connect (webrtc1, "pad-added", G_CALLBACK (on_incoming_stream),
       pipe1);
@@ -1309,8 +1309,25 @@ main (int argc, char *argv[])
 
   signaling_connection->connect_to_server_async();
 
-  g_main_loop_run (loop);
+  {
+      std::atomic_bool stop = false;
+      //*
+      std::thread t([&stop]() {
+          while (!stop) {
+              std::string line;
+              std::getline(std::cin, line);
+              if (!line.empty() && send_channel)
+                g_signal_emit_by_name(send_channel, "send-string", line.c_str());
+          }
+          });
+       //*/
 
+      g_main_loop_run(loop);
+
+      stop = true;
+
+      t.join();
+  }
   if (loop)
     g_main_loop_unref (loop);
 
