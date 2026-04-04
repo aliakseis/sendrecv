@@ -1,4 +1,4 @@
-CMakeLists.txt.user
+CMakeLists.txt.user*
 CMakeCache.txt
 CMakeFiles
 CMakeScripts
@@ -14,3 +14,7 @@ build/
 build64/
 
 .vs/
+
+out/
+CMakeSettings.json
+CMake*Presets.json
