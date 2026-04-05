@@ -42,7 +42,7 @@ else()
 endif()
 
 
-
+find_package(OpenSSL REQUIRED)
 
 find_package(crossguid CONFIG REQUIRED)
 
@@ -69,7 +69,13 @@ add_executable(sendrecv
 target_include_directories(sendrecv  PUBLIC ${GSTREAMER_INCLUDE_DIRS})
 
 # gstreamermm ライブラリの設定
-target_link_libraries(sendrecv  ${GSTREAMER_LIBRARIES} crossguid CURL::libcurl)
+target_link_libraries(sendrecv
+    ${GSTREAMER_LIBRARIES}
+    crossguid
+    CURL::libcurl
+    OpenSSL::SSL
+    OpenSSL::Crypto
+)
 #target_link_libraries(sendrecv  pthread)
 
 # gstreamer のコンパイルオプションを設定

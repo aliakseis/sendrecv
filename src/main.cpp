@@ -13,7 +13,6 @@
 #define GST_USE_UNSTABLE_API
 #include <gst/webrtc/webrtc.h>
 
-
 /* For signalling */
 #include "http.h"
 
@@ -28,10 +27,94 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
+#include <algorithm>
+#include <cstdint>
 
 #include <future>
 #include <atomic>
 #include <memory>
+
+#ifdef _MSC_VER
+#  undef restrict
+#  define restrict
+#endif
+
+#include <openssl/hmac.h>
+#include <openssl/evp.h> // recommended EVP API
+
+std::string hmac_sha256(const std::string& key, const std::string& data) {
+    unsigned char out[32];
+    unsigned int out_len = 0;
+
+    HMAC(EVP_sha256(),
+        key.data(), static_cast<int>(key.size()),
+        reinterpret_cast<const unsigned char*>(data.data()), data.size(),
+        out, &out_len);
+
+    return std::string(reinterpret_cast<char*>(out), out_len);
+}
+
+
+static std::string sha256(const std::string& data) {
+    // Compute SHA-256 digest via EVP
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len = 0;
+    EVP_MD_CTX* mdctx = EVP_MD_CTX_new();
+    if (!mdctx)
+        return {};
+
+    if (EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(mdctx, reinterpret_cast<const unsigned char*>(data.data()), data.size()) != 1 ||
+        EVP_DigestFinal_ex(mdctx, hash, &hash_len) != 1) {
+        EVP_MD_CTX_free(mdctx);
+        return {};
+    }
+    EVP_MD_CTX_free(mdctx);
+
+    return std::string(reinterpret_cast<char*>(hash), hash_len);
+}
+
+// URL-safe Base64 (RFC 4648 #5) without padding.
+// Input `bin` contains raw bytes (may have '\0' bytes).
+static std::string base64url_encode(const std::string &bin) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789-_"; // base64url alphabet: '+' -> '-', '/' -> '_'
+    size_t len = bin.size();
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+
+    size_t i = 0;
+    while (i + 2 < len) {
+        unsigned int b0 = static_cast<unsigned char>(bin[i]);
+        unsigned int b1 = static_cast<unsigned char>(bin[i+1]);
+        unsigned int b2 = static_cast<unsigned char>(bin[i+2]);
+        out.push_back(alphabet[(b0 >> 2) & 0x3F]);
+        out.push_back(alphabet[((b0 & 0x3) << 4) | ((b1 >> 4) & 0xF)]);
+        out.push_back(alphabet[((b1 & 0xF) << 2) | ((b2 >> 6) & 0x3)]);
+        out.push_back(alphabet[b2 & 0x3F]);
+        i += 3;
+    }
+
+    size_t rem = len - i;
+    if (rem == 1) {
+        unsigned int b0 = static_cast<unsigned char>(bin[i]);
+        out.push_back(alphabet[(b0 >> 2) & 0x3F]);
+        out.push_back(alphabet[((b0 & 0x3) << 4) & 0x3F]);
+        // no padding
+    } else if (rem == 2) {
+        unsigned int b0 = static_cast<unsigned char>(bin[i]);
+        unsigned int b1 = static_cast<unsigned char>(bin[i+1]);
+        out.push_back(alphabet[(b0 >> 2) & 0x3F]);
+        out.push_back(alphabet[((b0 & 0x3) << 4) | ((b1 >> 4) & 0xF)]);
+        out.push_back(alphabet[((b1 & 0xF) << 2) & 0x3F]);
+        // no padding
+    }
+
+    return out;
+}
 
 enum AppState
 {
@@ -110,7 +193,7 @@ static gboolean
 start_pipeline(gboolean create_offer);
 
 
-////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////
 
 struct ISignalingConnection {
     virtual bool connect_to_server_async() = 0;
@@ -130,9 +213,8 @@ std::thread signaling_runner;
 
 static std::atomic_bool requestInterrupted = false;
 
-const char send_message_url[] = "https://ntfy.sh/mediaThorSendRecv_%s";
-const char recv_message_url[] = "https://ntfy.sh/mediaThorSendRecv_%s/sse";
-
+// Use safe URL prefix constants; we'll append hashed session id.
+const char message_url_prefix[] = "https://ntfy.sh/mediaThorSR_";
 
 class NtfySignalingConnection : public ISignalingConnection
 {
@@ -146,9 +228,10 @@ protected:
     {
         const auto message = this_guid.str() + '\n' + text;
 
-        char buffer[1024];
-        sprintf(buffer, send_message_url, session_id);
-        http(HTTP_POST, buffer, nullptr, message.c_str(), message.length());
+        std::string hashed = base64url_encode(sha256(session_id));
+        std::string url = message_url_prefix + hashed;
+
+        http(HTTP_POST, url.c_str(), nullptr, message.c_str(), message.length());
     }
 
     static const char* verify_sse_response(CURL* curl) {
@@ -227,11 +310,48 @@ protected:
                                             their_giud = xg::Guid{ sender_guid };
 
                                         const auto message = pos + 1;
-                                        const bool is_syn = g_strcmp0(message, "SYN") == 0;
-                                        if (is_syn)
-                                            send_text("ACK");
 
-                                        if (is_syn || g_strcmp0(message, "ACK") == 0) {
+                                        // SYN <macA>
+                                        const auto is_syn = g_str_has_prefix(message, "SYN");
+                                        if (is_syn) {
+                                            // macA
+                                            const char* macA = message + 4; // after "SYN "
+
+                                            // expected macA
+                                            std::string expectedA = base64url_encode(hmac_sha256(session_id, their_giud.str() + "A"));
+
+                                            if (expectedA != macA) {
+                                                gst_printerr("MAC A mismatch, dropping connection\n");
+                                                requestInterrupted = true;
+                                                return size * nmemb;
+                                            }
+
+                                            // ACK <macB>
+                                            std::string min_id = (std::min)(this_guid.str(), their_giud.str());
+                                            std::string max_id = (std::max)(this_guid.str(), their_giud.str());
+                                            std::string macB = base64url_encode(hmac_sha256(session_id, min_id + max_id + "B"));
+                                            std::string ack_msg = "ACK " + macB;
+                                            send_text(ack_msg.data());
+                                        }
+
+                                        // ACK <macB>
+                                        const auto is_ack = !is_syn && g_str_has_prefix(message, "ACK");
+                                        if (is_ack) {
+
+                                            const char* macB = message + 4;
+
+                                            std::string min_id = (std::min)(this_guid.str(), their_giud.str());
+                                            std::string max_id = (std::max)(this_guid.str(), their_giud.str());
+                                            std::string expectedB = base64url_encode(hmac_sha256(session_id, min_id + max_id + "B"));
+
+                                            if (expectedB != macB) {
+                                                gst_printerr("MAC B mismatch, dropping connection\n");
+                                                requestInterrupted = true;
+                                                return size * nmemb;
+                                            }
+                                        }
+
+                                        if (is_syn || is_ack) {
                                             if (app_state < PEER_CONNECTED) {
                                                 app_state = PEER_CONNECTED;
                                                 /* Start negotiation (exchange SDP and ICE candidates) */
@@ -264,9 +384,11 @@ protected:
                         return requestInterrupted;
                 };
 
-                char buffer[1024];
-                sprintf(buffer, recv_message_url, session_id);
-                http(HTTP_GET, buffer, headers, nullptr, 0, on_data, verify_sse_response, progress_callback);
+                // Build recv URL with hashed session id
+                std::string hashed = base64url_encode(sha256(session_id));
+                std::string url = message_url_prefix + hashed + "/sse";
+
+                http(HTTP_GET, url.c_str(), headers, nullptr, 0, on_data, verify_sse_response, progress_callback);
         };
 
         // https://stackoverflow.com/a/23454840/10472202
@@ -275,7 +397,10 @@ protected:
         if (!startedResult.get())
             return false;
 
-        send_text("SYN");
+        std::string macA = base64url_encode(hmac_sha256(session_id, this_guid.str() + "A"));
+
+        std::string syn_msg = "SYN " + macA;
+        send_text(syn_msg.data());
 
         return true;
     }
@@ -508,8 +633,7 @@ protected:
 
 };
 
-////////////////////////////////////////////////////////////////////
-
+//////////////////////////////////////////////////////////////////////
 
 static gboolean
 cleanup_and_quit_loop (const gchar * msg, enum AppState state)
@@ -1221,7 +1345,6 @@ static void on_server_message(const gchar *text) {
 }
 
 
-
 static gboolean
 check_plugins ()
 {
@@ -1246,8 +1369,41 @@ check_plugins ()
   return ret;
 }
 
-int
-main (int argc, char *argv[])
+// Helper to pass both GObject* and message to the main loop
+struct SendData {
+    GObject* channel;
+    gchar* msg;
+};
+
+static gboolean send_string_to_channel(gpointer user_data)
+{
+    SendData* sd = static_cast<SendData*>(user_data);
+    if (sd->channel && sd->msg) {
+        g_signal_emit_by_name(sd->channel, "send-string", sd->msg);
+    }
+    g_free(sd->msg);
+    if (sd->channel)
+        g_object_unref(sd->channel);
+    g_free(sd);
+    return G_SOURCE_REMOVE;
+}
+
+void thread_func() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        if (line.empty())
+            continue;
+        if (!send_channel)
+            continue;
+        // Prepare data for main-loop invocation
+        SendData* sd = static_cast<SendData*>(g_malloc(sizeof(SendData)));
+        sd->channel = static_cast<GObject*>(g_object_ref(send_channel));
+        sd->msg = g_strdup(line.c_str());
+        g_idle_add(send_string_to_channel, sd);
+    }
+}
+
+int main (int argc, char *argv[])
 {
   GOptionContext *context;
   GError *error = nullptr;
@@ -1310,8 +1466,8 @@ main (int argc, char *argv[])
   signaling_connection->connect_to_server_async();
 
   {
+      /*
       std::atomic_bool stop = false;
-      //*
       std::thread t([&stop]() {
           while (!stop) {
               std::string line;
@@ -1320,13 +1476,13 @@ main (int argc, char *argv[])
                 g_signal_emit_by_name(send_channel, "send-string", line.c_str());
           }
           });
-       //*/
+      //*/
+
+      std::thread t(thread_func);
+      // Detach the stdin reader thread to avoid join hang on shutdown.
+      t.detach();
 
       g_main_loop_run(loop);
-
-      stop = true;
-
-      t.join();
   }
   if (loop)
     g_main_loop_unref (loop);
