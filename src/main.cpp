@@ -11,10 +11,7 @@
 #include <gst/rtp/rtp.h>
 
 #define GST_USE_UNSTABLE_API
-
-//extern "C" {
 #include <gst/webrtc/webrtc.h>
-//}
 
 /* For signalling */
 #include "http.h"
