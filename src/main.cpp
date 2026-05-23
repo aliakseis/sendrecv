@@ -1,4 +1,4 @@
-/*
+﻿/*
  * Demo gstreamer app for negotiating and streaming a sendrecv webrtc stream
  * with a browser JS app.
  *
@@ -198,7 +198,7 @@ start_pipeline(gboolean create_offer);
 struct ISignalingConnection {
     virtual bool connect_to_server_async() = 0;
     virtual bool we_create_offer() = 0;
-    virtual void send_text(gchar *text) = 0;
+    virtual void send_text(const gchar *text) = 0;
     virtual void close() = 0;
 };
 
@@ -224,7 +224,7 @@ protected:
         return this_guid.bytes() < their_giud.bytes();
     }
 
-    void send_text(gchar *text) override
+    void send_text(const gchar *text) override
     {
         const auto message = this_guid.str() + '\n' + text;
 
@@ -311,14 +311,46 @@ protected:
 
                                         const auto message = pos + 1;
 
-                                        // SYN <macA>
-                                        const auto is_syn = g_str_has_prefix(message, "SYN");
-                                        if (is_syn) {
-                                            // macA
-                                            const char* macA = message + 4; // after "SYN "
+                                        // =========================
+                                        // RECEIVE SIDE (SYN / ACK)
+                                        // =========================
 
-                                            // expected macA
-                                            std::string expectedA = base64url_encode(hmac_sha256(session_id, their_giud.str() + "A"));
+                                        const auto is_syn = g_str_has_prefix(message, "SYN");
+                                        const auto is_ack = !is_syn && g_str_has_prefix(message, "ACK");
+
+                                        if (is_syn) {
+
+                                            // Format: SYN <timestamp> <macA>
+                                            const char* p = message + 4; // skip "SYN "
+
+                                            // Parse timestamp
+                                            char* endptr = nullptr;
+                                            long ts = strtol(p, &endptr, 10);
+                                            if (endptr == p || ts <= 0) {
+                                                gst_printerr("Invalid timestamp in SYN\n");
+                                                requestInterrupted = true;
+                                                return size * nmemb;
+                                            }
+
+                                            // Skip spaces
+                                            while (*endptr == ' ') endptr++;
+
+                                            const char* macA = endptr;
+
+                                            // Anti‑replay window
+                                            time_t now = time(nullptr);
+                                            constexpr long ALLOWED_DRIFT = 10; // seconds
+
+                                            if (labs(now - ts) > ALLOWED_DRIFT) {
+                                                gst_printerr("Timestamp drift too large, dropping connection\n");
+                                                requestInterrupted = true;
+                                                return size * nmemb;
+                                            }
+
+                                            // expected macA = HMAC(session_id, their_guid + timestamp + "A")
+                                            std::string expectedA = base64url_encode(
+                                                hmac_sha256(session_id, their_giud.str() + std::to_string(ts) + "A")
+                                            );
 
                                             if (expectedA != macA) {
                                                 gst_printerr("MAC A mismatch, dropping connection\n");
@@ -326,23 +358,29 @@ protected:
                                                 return size * nmemb;
                                             }
 
-                                            // ACK <macB>
+                                            // Build ACK <macB>
                                             std::string min_id = (std::min)(this_guid.str(), their_giud.str());
                                             std::string max_id = (std::max)(this_guid.str(), their_giud.str());
-                                            std::string macB = base64url_encode(hmac_sha256(session_id, min_id + max_id + "B"));
+
+                                            std::string macB = base64url_encode(
+                                                hmac_sha256(session_id, min_id + max_id + "B")
+                                            );
+
                                             std::string ack_msg = "ACK " + macB;
-                                            send_text(ack_msg.data());
+                                            send_text(ack_msg.c_str());
                                         }
 
-                                        // ACK <macB>
-                                        const auto is_ack = !is_syn && g_str_has_prefix(message, "ACK");
-                                        if (is_ack) {
+                                        else if (is_ack) {
 
+                                            // Format: ACK <macB>
                                             const char* macB = message + 4;
 
                                             std::string min_id = (std::min)(this_guid.str(), their_giud.str());
                                             std::string max_id = (std::max)(this_guid.str(), their_giud.str());
-                                            std::string expectedB = base64url_encode(hmac_sha256(session_id, min_id + max_id + "B"));
+
+                                            std::string expectedB = base64url_encode(
+                                                hmac_sha256(session_id, min_id + max_id + "B")
+                                            );
 
                                             if (expectedB != macB) {
                                                 gst_printerr("MAC B mismatch, dropping connection\n");
@@ -351,17 +389,20 @@ protected:
                                             }
                                         }
 
+                                        // Common block for both SYN and ACK
                                         if (is_syn || is_ack) {
                                             if (app_state < PEER_CONNECTED) {
                                                 app_state = PEER_CONNECTED;
-                                                /* Start negotiation (exchange SDP and ICE candidates) */
-                                                if (we_create_offer() && !start_pipeline(TRUE))
+
+                                                if (we_create_offer() && !start_pipeline(TRUE)) {
                                                     cleanup_and_quit_loop("ERROR: failed to start pipeline",
                                                         PEER_CALL_ERROR);
+                                                }
                                             }
                                         }
-                                        else
+                                        else {
                                             on_server_message(message);
+                                        }
                                     }
                                 }
                             }
@@ -397,10 +438,22 @@ protected:
         if (!startedResult.get())
             return false;
 
-        std::string macA = base64url_encode(hmac_sha256(session_id, this_guid.str() + "A"));
+        // =========================
+        // SEND SIDE (SYN)
+        // =========================
 
-        std::string syn_msg = "SYN " + macA;
-        send_text(syn_msg.data());
+        // timestamp
+        time_t now = time(nullptr);
+        std::string ts = std::to_string(now);
+
+        // macA = HMAC(session_id, this_guid + timestamp + "A")
+        std::string macA = base64url_encode(
+            hmac_sha256(session_id, this_guid.str() + ts + "A")
+        );
+
+        // SYN <timestamp> <macA>
+        std::string syn_msg = "SYN " + ts + " " + macA;
+        send_text(syn_msg.c_str());
 
         return true;
     }
@@ -439,7 +492,7 @@ protected:
         }
     }
 
-    void send_text(gchar *text) override
+    void send_text(const gchar *text) override
     {
         soup_websocket_connection_send_text(ws_conn, text);
     }
